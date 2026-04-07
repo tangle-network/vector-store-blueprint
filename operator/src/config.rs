@@ -16,8 +16,29 @@ pub enum VectorBackend {
     Qdrant { url: String },
     #[serde(rename = "chromadb")]
     ChromaDB { url: String },
+    #[serde(rename = "pgvector")]
+    PgVector { connection_string: String },
+    #[serde(rename = "milvus")]
+    Milvus { url: String },
+    #[serde(rename = "weaviate")]
+    Weaviate { url: String },
+    #[serde(rename = "pinecone")]
+    Pinecone {
+        api_key: String,
+        environment: String,
+    },
     #[serde(rename = "inmemory")]
     InMemory,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct StorageTier {
+    pub name: String,
+    pub storage_gb: u64,
+    pub included_queries_per_month: u64,
+    pub included_upserts_per_month: u64,
+    /// Subscription rate in payment token base units per month.
+    pub subscription_rate: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -25,11 +46,15 @@ pub struct VectorStoreConfig {
     #[serde(default = "default_backend")]
     pub backend: VectorBackend,
 
-    /// Price per 1K vector upserts (payment token base units, e.g. 10000 = 0.01 USDC with 6 decimals).
+    /// Available storage tiers (customers choose at service creation).
+    #[serde(default = "default_tiers")]
+    pub tiers: Vec<StorageTier>,
+
+    /// Overage price per 1K upserts beyond tier quota (payment token base units).
     #[serde(default = "default_price_per_k_upserts")]
     pub price_per_k_upserts: u64,
 
-    /// Price per 1K similarity queries (payment token base units, e.g. 5000 = 0.005 USDC with 6 decimals).
+    /// Overage price per 1K queries beyond tier quota (payment token base units).
     #[serde(default = "default_price_per_k_queries")]
     pub price_per_k_queries: u64,
 
@@ -44,6 +69,32 @@ pub struct VectorStoreConfig {
 
 fn default_backend() -> VectorBackend {
     VectorBackend::InMemory
+}
+
+fn default_tiers() -> Vec<StorageTier> {
+    vec![
+        StorageTier {
+            name: "starter".into(),
+            storage_gb: 1,
+            included_queries_per_month: 100_000,
+            included_upserts_per_month: 50_000,
+            subscription_rate: 100_000,
+        },
+        StorageTier {
+            name: "growth".into(),
+            storage_gb: 10,
+            included_queries_per_month: 1_000_000,
+            included_upserts_per_month: 500_000,
+            subscription_rate: 750_000,
+        },
+        StorageTier {
+            name: "scale".into(),
+            storage_gb: 100,
+            included_queries_per_month: 10_000_000,
+            included_upserts_per_month: 5_000_000,
+            subscription_rate: 5_000_000,
+        },
+    ]
 }
 
 fn default_price_per_k_upserts() -> u64 {
@@ -83,6 +134,7 @@ impl Default for VectorStoreConfig {
     fn default() -> Self {
         Self {
             backend: default_backend(),
+            tiers: default_tiers(),
             price_per_k_upserts: default_price_per_k_upserts(),
             price_per_k_queries: default_price_per_k_queries(),
             max_collections: default_max_collections(),

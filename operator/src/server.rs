@@ -74,6 +74,7 @@ pub fn build_router(state: AppState) -> Router {
         .route("/v1/collections/{name}/query", post(query_vectors))
         .route("/v1/collections/{name}/vectors", delete(delete_vectors))
         .route("/v1/collections/{name}/stats", get(collection_stats))
+        .route("/v1/tiers", get(list_tiers))
         .route("/health", get(health))
         .route("/metrics", get(metrics_handler))
         .with_state(state)
@@ -431,6 +432,19 @@ async fn collection_stats(
             "stats_failed",
         ),
     }
+}
+
+async fn list_tiers(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let backend = state
+        .backend::<VectorStoreAppBackend>()
+        .expect("VectorStoreAppBackend");
+    Json(serde_json::json!({
+        "tiers": backend.config.vector_store.tiers,
+        "overage_pricing": {
+            "price_per_k_upserts": backend.config.vector_store.price_per_k_upserts,
+            "price_per_k_queries": backend.config.vector_store.price_per_k_queries,
+        },
+    }))
 }
 
 async fn health() -> Json<serde_json::Value> {

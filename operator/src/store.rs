@@ -655,14 +655,444 @@ impl VectorStoreBackend for InMemoryBackend {
     }
 }
 
+// ── Proxy Backend (ChromaDB, pgvector, Milvus, Weaviate, Pinecone) ────
+//
+// Each of these wraps a remote vector database's REST API. They share the
+// same trait and pattern: HTTP client + URL + provider-specific request/
+// response mapping. For v1, they all delegate to a `GenericHttpBackend`
+// that maps our trait calls to provider-specific endpoints.
+
+/// Generic HTTP-based vector store backend. Wraps any REST API that
+/// exposes create/list/delete/upsert/query/stats endpoints.
+pub struct HttpProxyBackend {
+    client: reqwest::Client,
+    url: String,
+    provider: ProxyProvider,
+    api_key: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub enum ProxyProvider {
+    ChromaDB,
+    PgVector,
+    Milvus,
+    Weaviate,
+    Pinecone { environment: String },
+}
+
+impl HttpProxyBackend {
+    pub fn new(url: String, provider: ProxyProvider, api_key: Option<String>) -> Self {
+        Self {
+            client: reqwest::Client::new(),
+            url: url.trim_end_matches('/').to_string(),
+            provider,
+            api_key,
+        }
+    }
+
+    fn auth_header(&self) -> Option<(&str, &str)> {
+        match (&self.provider, &self.api_key) {
+            (ProxyProvider::Pinecone { .. }, Some(key)) => Some(("Api-Key", key.as_str())),
+            (_, Some(key)) => Some(("Authorization", key.as_str())),
+            _ => None,
+        }
+    }
+
+    fn request(&self, method: reqwest::Method, path: &str) -> reqwest::RequestBuilder {
+        let mut req = self.client.request(method, format!("{}{}", self.url, path));
+        if let Some((header, value)) = self.auth_header() {
+            req = req.header(header, value);
+        }
+        req
+    }
+}
+
+#[async_trait::async_trait]
+impl VectorStoreBackend for HttpProxyBackend {
+    async fn create_collection(
+        &self,
+        name: &str,
+        dimensions: u32,
+        distance: DistanceMetric,
+    ) -> anyhow::Result<()> {
+        let body = match &self.provider {
+            ProxyProvider::ChromaDB => serde_json::json!({
+                "name": name,
+                "metadata": { "dimensions": dimensions, "distance": distance.to_qdrant_str() }
+            }),
+            ProxyProvider::PgVector => serde_json::json!({
+                "name": name, "dimensions": dimensions, "distance": distance.to_qdrant_str()
+            }),
+            ProxyProvider::Milvus => serde_json::json!({
+                "collectionName": name,
+                "schema": {
+                    "fields": [
+                        { "fieldName": "id", "dataType": "VarChar", "isPrimary": true, "params": { "max_length": "256" } },
+                        { "fieldName": "vector", "dataType": "FloatVector", "params": { "dim": dimensions } },
+                        { "fieldName": "metadata", "dataType": "JSON" }
+                    ]
+                }
+            }),
+            ProxyProvider::Weaviate => serde_json::json!({
+                "class": name,
+                "vectorizer": "none",
+                "properties": [{ "name": "metadata", "dataType": ["text"] }]
+            }),
+            ProxyProvider::Pinecone { .. } => serde_json::json!({
+                "name": name,
+                "dimension": dimensions,
+                "metric": match distance { DistanceMetric::Cosine => "cosine", DistanceMetric::Euclidean => "euclidean", DistanceMetric::DotProduct => "dotproduct" }
+            }),
+        };
+
+        let path = match &self.provider {
+            ProxyProvider::ChromaDB => "/api/v1/collections".to_string(),
+            ProxyProvider::PgVector => "/rpc/create_collection".to_string(),
+            ProxyProvider::Milvus => "/v2/vectordb/collections/create".to_string(),
+            ProxyProvider::Weaviate => "/v1/schema".to_string(),
+            ProxyProvider::Pinecone { .. } => {
+                // Pinecone control plane
+                return self.create_pinecone_index(name, dimensions, distance).await;
+            }
+        };
+
+        let resp = self.request(reqwest::Method::POST, &path).json(&body).send().await?;
+        if !resp.status().is_success() {
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("{:?} create_collection failed: {err}", self.provider);
+        }
+        Ok(())
+    }
+
+    async fn list_collections(&self) -> anyhow::Result<Vec<CollectionInfo>> {
+        let path = match &self.provider {
+            ProxyProvider::ChromaDB => "/api/v1/collections",
+            ProxyProvider::PgVector => "/rpc/list_collections",
+            ProxyProvider::Milvus => "/v2/vectordb/collections/list",
+            ProxyProvider::Weaviate => "/v1/schema",
+            ProxyProvider::Pinecone { .. } => "https://api.pinecone.io/indexes",
+        };
+
+        let resp = self.request(reqwest::Method::GET, path).send().await?;
+        if !resp.status().is_success() {
+            anyhow::bail!("{:?} list_collections failed", self.provider);
+        }
+
+        let json: serde_json::Value = resp.json().await?;
+
+        // Each provider returns collections differently — extract names
+        let names: Vec<String> = match &self.provider {
+            ProxyProvider::ChromaDB => json
+                .as_array()
+                .map(|a| a.iter().filter_map(|c| c["name"].as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default(),
+            ProxyProvider::Milvus => json["data"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|s| s.as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default(),
+            ProxyProvider::Weaviate => json["classes"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|c| c["class"].as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default(),
+            ProxyProvider::Pinecone { .. } => json["indexes"]
+                .as_array()
+                .map(|a| a.iter().filter_map(|i| i["name"].as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default(),
+            ProxyProvider::PgVector => json
+                .as_array()
+                .map(|a| a.iter().filter_map(|c| c["name"].as_str().map(|s| s.to_string())).collect())
+                .unwrap_or_default(),
+        };
+
+        Ok(names.into_iter().map(|name| CollectionInfo { name, dimensions: 0, distance_metric: DistanceMetric::Cosine }).collect())
+    }
+
+    async fn delete_collection(&self, name: &str) -> anyhow::Result<()> {
+        let (method, path) = match &self.provider {
+            ProxyProvider::ChromaDB => (reqwest::Method::DELETE, format!("/api/v1/collections/{name}")),
+            ProxyProvider::PgVector => (reqwest::Method::POST, "/rpc/delete_collection".to_string()),
+            ProxyProvider::Milvus => (reqwest::Method::POST, "/v2/vectordb/collections/drop".to_string()),
+            ProxyProvider::Weaviate => (reqwest::Method::DELETE, format!("/v1/schema/{name}")),
+            ProxyProvider::Pinecone { .. } => (reqwest::Method::DELETE, format!("/indexes/{name}")),
+        };
+
+        let mut req = self.request(method, &path);
+        if matches!(self.provider, ProxyProvider::Milvus | ProxyProvider::PgVector) {
+            req = req.json(&serde_json::json!({ "collectionName": name, "name": name }));
+        }
+
+        let resp = req.send().await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(()); // idempotent
+        }
+        if !resp.status().is_success() {
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("{:?} delete_collection failed: {err}", self.provider);
+        }
+        Ok(())
+    }
+
+    async fn upsert(&self, collection: &str, points: Vec<Point>) -> anyhow::Result<UpsertResult> {
+        let count = points.len() as u64;
+        let body = match &self.provider {
+            ProxyProvider::ChromaDB => serde_json::json!({
+                "ids": points.iter().map(|p| &p.id).collect::<Vec<_>>(),
+                "embeddings": points.iter().map(|p| &p.vector).collect::<Vec<_>>(),
+                "metadatas": points.iter().map(|p| &p.metadata).collect::<Vec<_>>(),
+            }),
+            ProxyProvider::Milvus => serde_json::json!({
+                "collectionName": collection,
+                "data": points.iter().map(|p| serde_json::json!({
+                    "id": p.id, "vector": p.vector, "metadata": p.metadata
+                })).collect::<Vec<_>>(),
+            }),
+            ProxyProvider::Weaviate => serde_json::json!({
+                "objects": points.iter().map(|p| serde_json::json!({
+                    "class": collection,
+                    "id": p.id,
+                    "vector": p.vector,
+                    "properties": { "metadata": p.metadata.to_string() }
+                })).collect::<Vec<_>>(),
+            }),
+            ProxyProvider::Pinecone { .. } => serde_json::json!({
+                "vectors": points.iter().map(|p| serde_json::json!({
+                    "id": p.id, "values": p.vector, "metadata": p.metadata
+                })).collect::<Vec<_>>(),
+            }),
+            ProxyProvider::PgVector => serde_json::json!({
+                "collection": collection,
+                "points": points.iter().map(|p| serde_json::json!({
+                    "id": p.id, "vector": p.vector, "metadata": p.metadata
+                })).collect::<Vec<_>>(),
+            }),
+        };
+
+        let path = match &self.provider {
+            ProxyProvider::ChromaDB => format!("/api/v1/collections/{collection}/upsert"),
+            ProxyProvider::Milvus => "/v2/vectordb/entities/upsert".to_string(),
+            ProxyProvider::Weaviate => "/v1/batch/objects".to_string(),
+            ProxyProvider::Pinecone { .. } => "/vectors/upsert".to_string(),
+            ProxyProvider::PgVector => "/rpc/upsert_vectors".to_string(),
+        };
+
+        let resp = self.request(reqwest::Method::POST, &path).json(&body).send().await?;
+        if !resp.status().is_success() {
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("{:?} upsert failed: {err}", self.provider);
+        }
+        Ok(UpsertResult { upserted_count: count })
+    }
+
+    async fn query(
+        &self,
+        collection: &str,
+        vector: Vec<f32>,
+        top_k: usize,
+        _filter: Option<QueryFilter>,
+    ) -> anyhow::Result<Vec<ScoredPoint>> {
+        let body = match &self.provider {
+            ProxyProvider::ChromaDB => serde_json::json!({
+                "query_embeddings": [vector],
+                "n_results": top_k,
+            }),
+            ProxyProvider::Milvus => serde_json::json!({
+                "collectionName": collection,
+                "data": [vector],
+                "limit": top_k,
+                "outputFields": ["metadata"],
+            }),
+            ProxyProvider::Weaviate => serde_json::json!({
+                "query": format!(
+                    "{{ Get {{ {collection}(nearVector: {{ vector: {vector:?} }}, limit: {top_k}) {{ _additional {{ id distance }} metadata }} }} }}"
+                ),
+            }),
+            ProxyProvider::Pinecone { .. } => serde_json::json!({
+                "vector": vector,
+                "topK": top_k,
+                "includeMetadata": true,
+            }),
+            ProxyProvider::PgVector => serde_json::json!({
+                "collection": collection,
+                "vector": vector,
+                "top_k": top_k,
+            }),
+        };
+
+        let path = match &self.provider {
+            ProxyProvider::ChromaDB => format!("/api/v1/collections/{collection}/query"),
+            ProxyProvider::Milvus => "/v2/vectordb/entities/search".to_string(),
+            ProxyProvider::Weaviate => "/v1/graphql".to_string(),
+            ProxyProvider::Pinecone { .. } => "/query".to_string(),
+            ProxyProvider::PgVector => "/rpc/query_vectors".to_string(),
+        };
+
+        let resp = self.request(reqwest::Method::POST, &path).json(&body).send().await?;
+        if !resp.status().is_success() {
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("{:?} query failed: {err}", self.provider);
+        }
+
+        let json: serde_json::Value = resp.json().await?;
+
+        // Parse results (provider-specific)
+        let results = match &self.provider {
+            ProxyProvider::ChromaDB => {
+                let ids = json["ids"][0].as_array();
+                let distances = json["distances"][0].as_array();
+                let metadatas = json["metadatas"][0].as_array();
+                match (ids, distances) {
+                    (Some(ids), Some(dists)) => ids.iter().zip(dists.iter()).enumerate().map(|(i, (id, dist))| {
+                        ScoredPoint {
+                            id: id.as_str().unwrap_or_default().to_string(),
+                            score: 1.0 - dist.as_f64().unwrap_or(1.0) as f32,
+                            metadata: metadatas.and_then(|m| m.get(i)).cloned().unwrap_or_default(),
+                        }
+                    }).collect(),
+                    _ => Vec::new(),
+                }
+            }
+            ProxyProvider::Milvus => json["data"]
+                .as_array()
+                .map(|a| a.iter().map(|r| ScoredPoint {
+                    id: r["id"].as_str().or_else(|| r["id"].as_u64().map(|_| "")).map(|s| s.to_string()).unwrap_or_default(),
+                    score: r["distance"].as_f64().unwrap_or(0.0) as f32,
+                    metadata: r["metadata"].clone(),
+                }).collect())
+                .unwrap_or_default(),
+            ProxyProvider::Weaviate => {
+                // GraphQL response parsing
+                let get = &json["data"]["Get"];
+                if let Some(obj) = get.as_object().and_then(|o| o.values().next()) {
+                    obj.as_array().map(|a| a.iter().map(|r| ScoredPoint {
+                        id: r["_additional"]["id"].as_str().unwrap_or_default().to_string(),
+                        score: 1.0 - r["_additional"]["distance"].as_f64().unwrap_or(1.0) as f32,
+                        metadata: serde_json::json!(r["metadata"]),
+                    }).collect()).unwrap_or_default()
+                } else {
+                    Vec::new()
+                }
+            }
+            ProxyProvider::Pinecone { .. } => json["matches"]
+                .as_array()
+                .map(|a| a.iter().map(|r| ScoredPoint {
+                    id: r["id"].as_str().unwrap_or_default().to_string(),
+                    score: r["score"].as_f64().unwrap_or(0.0) as f32,
+                    metadata: r["metadata"].clone(),
+                }).collect())
+                .unwrap_or_default(),
+            ProxyProvider::PgVector => json
+                .as_array()
+                .map(|a| a.iter().map(|r| ScoredPoint {
+                    id: r["id"].as_str().unwrap_or_default().to_string(),
+                    score: r["score"].as_f64().unwrap_or(0.0) as f32,
+                    metadata: r["metadata"].clone(),
+                }).collect())
+                .unwrap_or_default(),
+        };
+
+        Ok(results)
+    }
+
+    async fn delete_vectors(&self, collection: &str, ids: Vec<String>) -> anyhow::Result<DeleteResult> {
+        let count = ids.len() as u64;
+        let body = match &self.provider {
+            ProxyProvider::ChromaDB => serde_json::json!({ "ids": ids }),
+            ProxyProvider::Milvus => serde_json::json!({ "collectionName": collection, "filter": format!("id in {:?}", ids) }),
+            ProxyProvider::Weaviate => serde_json::json!({ "match": { "class": collection, "ids": ids } }),
+            ProxyProvider::Pinecone { .. } => serde_json::json!({ "ids": ids }),
+            ProxyProvider::PgVector => serde_json::json!({ "collection": collection, "ids": ids }),
+        };
+
+        let path = match &self.provider {
+            ProxyProvider::ChromaDB => format!("/api/v1/collections/{collection}/delete"),
+            ProxyProvider::Milvus => "/v2/vectordb/entities/delete".to_string(),
+            ProxyProvider::Weaviate => "/v1/batch/objects".to_string(),
+            ProxyProvider::Pinecone { .. } => "/vectors/delete".to_string(),
+            ProxyProvider::PgVector => "/rpc/delete_vectors".to_string(),
+        };
+
+        let method = if matches!(self.provider, ProxyProvider::Weaviate) {
+            reqwest::Method::DELETE
+        } else {
+            reqwest::Method::POST
+        };
+
+        let resp = self.request(method, &path).json(&body).send().await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(DeleteResult { deleted_count: 0 });
+        }
+        if !resp.status().is_success() {
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("{:?} delete_vectors failed: {err}", self.provider);
+        }
+        Ok(DeleteResult { deleted_count: count })
+    }
+
+    async fn collection_stats(&self, name: &str) -> anyhow::Result<CollectionStats> {
+        // Most providers don't have a clean stats endpoint — return best-effort
+        Ok(CollectionStats {
+            name: name.to_string(),
+            vector_count: 0, // would need provider-specific query
+            dimensions: 0,
+            distance_metric: DistanceMetric::Cosine,
+            size_bytes: 0,
+        })
+    }
+}
+
+impl HttpProxyBackend {
+    async fn create_pinecone_index(
+        &self,
+        name: &str,
+        dimensions: u32,
+        distance: DistanceMetric,
+    ) -> anyhow::Result<()> {
+        let metric = match distance {
+            DistanceMetric::Cosine => "cosine",
+            DistanceMetric::Euclidean => "euclidean",
+            DistanceMetric::DotProduct => "dotproduct",
+        };
+        let body = serde_json::json!({
+            "name": name,
+            "dimension": dimensions,
+            "metric": metric,
+            "spec": { "serverless": { "cloud": "aws", "region": "us-east-1" } }
+        });
+        let resp = self.client
+            .post("https://api.pinecone.io/indexes")
+            .header("Api-Key", self.api_key.as_deref().unwrap_or_default())
+            .json(&body)
+            .send()
+            .await?;
+        if !resp.status().is_success() {
+            let err = resp.text().await.unwrap_or_default();
+            anyhow::bail!("Pinecone create index failed: {err}");
+        }
+        Ok(())
+    }
+}
+
 /// Build the appropriate backend from config.
 pub fn build_backend(backend: &VectorBackend) -> Box<dyn VectorStoreBackend> {
     match backend {
         VectorBackend::Qdrant { url } => Box::new(QdrantBackend::new(url.clone())),
-        VectorBackend::ChromaDB { url } => {
-            tracing::warn!(url = %url, "ChromaDB backend not yet implemented, falling back to InMemory");
-            Box::new(InMemoryBackend::new())
-        }
+        VectorBackend::ChromaDB { url } => Box::new(HttpProxyBackend::new(
+            url.clone(), ProxyProvider::ChromaDB, None,
+        )),
+        VectorBackend::PgVector { connection_string } => Box::new(HttpProxyBackend::new(
+            connection_string.clone(), ProxyProvider::PgVector, None,
+        )),
+        VectorBackend::Milvus { url } => Box::new(HttpProxyBackend::new(
+            url.clone(), ProxyProvider::Milvus, None,
+        )),
+        VectorBackend::Weaviate { url } => Box::new(HttpProxyBackend::new(
+            url.clone(), ProxyProvider::Weaviate, None,
+        )),
+        VectorBackend::Pinecone { api_key, environment } => Box::new(HttpProxyBackend::new(
+            format!("https://controller.{environment}.pinecone.io"),
+            ProxyProvider::Pinecone { environment: environment.clone() },
+            Some(api_key.clone()),
+        )),
         VectorBackend::InMemory => Box::new(InMemoryBackend::new()),
     }
 }
