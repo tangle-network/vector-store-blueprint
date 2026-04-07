@@ -1,0 +1,6 @@
+target/
+out/
+cache/
+node_modules/
+.env
+*.log
