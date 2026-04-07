@@ -109,6 +109,27 @@ pub async fn start(
     Ok(handle)
 }
 
+// ── Validation ────────────────────────────────────────────────────────
+
+fn validate_collection_name(name: &str) -> Result<(), Response> {
+    if name.is_empty()
+        || name.contains("..")
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+        || name.trim().is_empty()
+        || name.len() > 256
+    {
+        return Err(error_response(
+            StatusCode::BAD_REQUEST,
+            format!("invalid collection name: {name:?}"),
+            "validation_error",
+            "invalid_collection_name",
+        ));
+    }
+    Ok(())
+}
+
 // ── Handlers ───────────────────────────────────────────────────────────
 
 async fn create_collection(
@@ -125,13 +146,8 @@ async fn create_collection(
         Err(resp) => return resp,
     };
 
-    if req.name.is_empty() {
-        return error_response(
-            StatusCode::BAD_REQUEST,
-            "collection name must not be empty".into(),
-            "validation_error",
-            "empty_name",
-        );
+    if let Err(resp) = validate_collection_name(&req.name) {
+        return resp;
     }
 
     if req.dimensions == 0 {
@@ -141,6 +157,21 @@ async fn create_collection(
             "validation_error",
             "invalid_dimensions",
         );
+    }
+
+    // Enforce max_collections capacity limit
+    let max_cols = backend.config.vector_store.max_collections;
+    if max_cols > 0 {
+        if let Ok(existing) = backend.store.list_collections().await {
+            if existing.len() >= max_cols as usize {
+                return error_response(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    format!("collection limit reached ({max_cols})"),
+                    "capacity_error",
+                    "max_collections_exceeded",
+                );
+            }
+        }
     }
 
     match backend
@@ -203,6 +234,10 @@ async fn delete_collection(
         Ok(v) => v,
         Err(resp) => return resp,
     };
+
+    if let Err(resp) = validate_collection_name(&name) {
+        return resp;
+    }
 
     match backend.store.delete_collection(&name).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),

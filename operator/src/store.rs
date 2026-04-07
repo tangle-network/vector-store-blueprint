@@ -326,7 +326,12 @@ impl VectorStoreBackend for QdrantBackend {
         Ok(results
             .into_iter()
             .map(|r| ScoredPoint {
-                id: r["id"].as_str().unwrap_or_default().to_string(),
+                id: r["id"]
+                    .as_str()
+                    .map(|s| s.to_string())
+                    .or_else(|| r["id"].as_u64().map(|n| n.to_string()))
+                    .or_else(|| r["id"].as_i64().map(|n| n.to_string()))
+                    .unwrap_or_default(),
                 score: r["score"].as_f64().unwrap_or(0.0) as f32,
                 metadata: r["payload"].clone(),
             })
@@ -383,7 +388,10 @@ impl VectorStoreBackend for QdrantBackend {
             _ => DistanceMetric::Cosine,
         };
 
-        let vector_count = result["vectors_count"].as_u64().unwrap_or(0);
+        let vector_count = result["points_count"]
+            .as_u64()
+            .or_else(|| result["vectors_count"].as_u64())
+            .unwrap_or(0);
         // Approximate size: count * (dimensions * 4 bytes + overhead)
         let size_bytes = vector_count * (dimensions as u64 * 4 + 64);
 
@@ -566,6 +574,14 @@ impl VectorStoreBackend for InMemoryBackend {
             .collections
             .get(collection)
             .ok_or_else(|| anyhow::anyhow!("collection '{collection}' not found"))?;
+
+        if vector.len() != coll.dimensions as usize {
+            anyhow::bail!(
+                "query vector dimension mismatch: collection has {} dimensions, query has {}",
+                coll.dimensions,
+                vector.len()
+            );
+        }
 
         let mut scored: Vec<(String, f32, serde_json::Value)> = Vec::new();
 
