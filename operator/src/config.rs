@@ -25,11 +25,11 @@ pub struct VectorStoreConfig {
     #[serde(default = "default_backend")]
     pub backend: VectorBackend,
 
-    /// Price per 1K vector upserts (tsUSD base units).
+    /// Price per 1K vector upserts (payment token base units, e.g. 10000 = 0.01 USDC with 6 decimals).
     #[serde(default = "default_price_per_k_upserts")]
     pub price_per_k_upserts: u64,
 
-    /// Price per 1K similarity queries (tsUSD base units).
+    /// Price per 1K similarity queries (payment token base units, e.g. 5000 = 0.005 USDC with 6 decimals).
     #[serde(default = "default_price_per_k_queries")]
     pub price_per_k_queries: u64,
 
@@ -47,11 +47,11 @@ fn default_backend() -> VectorBackend {
 }
 
 fn default_price_per_k_upserts() -> u64 {
-    10_000 // 0.01 tsUSD per 1K vectors
+    10_000 // 0.01 payment token per 1K vectors
 }
 
 fn default_price_per_k_queries() -> u64 {
-    5_000 // 0.005 tsUSD per 1K queries
+    5_000 // 0.005 payment token per 1K queries
 }
 
 fn default_max_collections() -> u32 {

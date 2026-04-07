@@ -49,13 +49,14 @@ contract VectorStoreBSM is Initializable, UUPSUpgradeable, BlueprintServiceManag
     VectorStorePricing public pricing;
     mapping(address => OperatorInfo) public operatorInfo;
     EnumerableSet.AddressSet private _operators;
-    address public tsUSD;
+    /// The accepted payment token (e.g. USDC wrapped via VAnchor).
+    address public paymentToken;
 
     // ── Initialization ──────────────────────────────────────────────────
 
-    function initialize(address _tsUSD) external initializer {
+    function initialize(address _paymentToken) external initializer {
         __UUPSUpgradeable_init();
-        tsUSD = _tsUSD;
+        paymentToken = _paymentToken;
         pricing = VectorStorePricing({
             pricePerGbMonth: 100_000,
             pricePerKUpserts: 10_000,
