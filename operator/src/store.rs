@@ -482,18 +482,20 @@ impl VectorStoreBackend for InMemoryBackend {
         dimensions: u32,
         distance: DistanceMetric,
     ) -> anyhow::Result<()> {
-        if self.collections.contains_key(name) {
-            anyhow::bail!("collection '{name}' already exists");
+        use dashmap::mapref::entry::Entry;
+        match self.collections.entry(name.to_string()) {
+            Entry::Occupied(_) => {
+                anyhow::bail!("collection '{name}' already exists");
+            }
+            Entry::Vacant(e) => {
+                e.insert(InMemoryCollection {
+                    dimensions,
+                    distance_metric: distance,
+                    vectors: DashMap::new(),
+                    vector_count: AtomicU64::new(0),
+                });
+            }
         }
-        self.collections.insert(
-            name.to_string(),
-            InMemoryCollection {
-                dimensions,
-                distance_metric: distance,
-                vectors: DashMap::new(),
-                vector_count: AtomicU64::new(0),
-            },
-        );
         Ok(())
     }
 
@@ -535,11 +537,15 @@ impl VectorStoreBackend for InMemoryBackend {
                     point.vector.len()
                 );
             }
-            let is_new = !coll.vectors.contains_key(&point.id);
-            coll.vectors
-                .insert(point.id, (point.vector, point.metadata));
-            if is_new {
-                coll.vector_count.fetch_add(1, Ordering::Relaxed);
+            use dashmap::mapref::entry::Entry;
+            match coll.vectors.entry(point.id) {
+                Entry::Occupied(mut e) => {
+                    e.insert((point.vector, point.metadata));
+                }
+                Entry::Vacant(e) => {
+                    e.insert((point.vector, point.metadata));
+                    coll.vector_count.fetch_add(1, Ordering::Relaxed);
+                }
             }
             upserted += 1;
         }

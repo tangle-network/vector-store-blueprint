@@ -65,7 +65,7 @@ contract VectorStoreBSM is Initializable, UUPSUpgradeable, BlueprintServiceManag
         });
     }
 
-    function _authorizeUpgrade(address) internal override {}
+    function _authorizeUpgrade(address) internal override onlyBlueprintOwner {}
 
     // ── Admin ───────────────────────────────────────────────────────────
 

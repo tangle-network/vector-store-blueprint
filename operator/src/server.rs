@@ -34,6 +34,10 @@ use crate::store::{
     VectorStoreBackend,
 };
 
+/// Minimum billing cost for admin operations (create/delete/list/stats).
+/// Essentially free but requires valid SpendAuth.
+const MIN_ADMIN_COST: u64 = 1000;
+
 /// Backend state attached to AppState.
 pub struct VectorStoreAppBackend {
     pub store: Arc<dyn VectorStoreBackend>,
@@ -109,11 +113,17 @@ pub async fn start(
 
 async fn create_collection(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Json(req): Json<CreateCollectionRequest>,
 ) -> Response {
     let backend = state
         .backend::<VectorStoreAppBackend>()
         .expect("VectorStoreAppBackend");
+
+    let (_spend_auth, _preauth) = match billing_gate(&state, &headers, None, MIN_ADMIN_COST).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
 
     if req.name.is_empty() {
         return error_response(
@@ -156,10 +166,18 @@ async fn create_collection(
     }
 }
 
-async fn list_collections(State(state): State<AppState>) -> Response {
+async fn list_collections(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Response {
     let backend = state
         .backend::<VectorStoreAppBackend>()
         .expect("VectorStoreAppBackend");
+
+    let (_spend_auth, _preauth) = match billing_gate(&state, &headers, None, MIN_ADMIN_COST).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
 
     match backend.store.list_collections().await {
         Ok(collections) => Json(serde_json::json!({ "collections": collections })).into_response(),
@@ -174,11 +192,17 @@ async fn list_collections(State(state): State<AppState>) -> Response {
 
 async fn delete_collection(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Response {
     let backend = state
         .backend::<VectorStoreAppBackend>()
         .expect("VectorStoreAppBackend");
+
+    let (_spend_auth, _preauth) = match billing_gate(&state, &headers, None, MIN_ADMIN_COST).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
 
     match backend.store.delete_collection(&name).await {
         Ok(()) => StatusCode::NO_CONTENT.into_response(),
@@ -208,6 +232,31 @@ async fn upsert_vectors(
             "validation_error",
             "empty_vectors",
         );
+    }
+
+    // Reject 0-dimension vectors and mismatched dimensions within batch
+    let expected_dim = req.vectors[0].vector.len();
+    if expected_dim == 0 {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "vector dimensions must be > 0".into(),
+            "validation_error",
+            "zero_dimensions",
+        );
+    }
+    for (i, p) in req.vectors.iter().enumerate() {
+        if p.vector.len() != expected_dim {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "dimension mismatch in batch: vector[0] has {} dims, vector[{i}] has {}",
+                    expected_dim,
+                    p.vector.len()
+                ),
+                "validation_error",
+                "dimension_mismatch",
+            );
+        }
     }
 
     let _permit = match acquire_permit(&state) {
@@ -300,12 +349,18 @@ async fn query_vectors(
 
 async fn delete_vectors(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(name): Path<String>,
     Json(req): Json<DeleteVectorsRequest>,
 ) -> Response {
     let backend = state
         .backend::<VectorStoreAppBackend>()
         .expect("VectorStoreAppBackend");
+
+    let (_spend_auth, _preauth) = match billing_gate(&state, &headers, None, MIN_ADMIN_COST).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
 
     match backend.store.delete_vectors(&name, req.ids).await {
         Ok(result) => Json(result).into_response(),
@@ -320,11 +375,17 @@ async fn delete_vectors(
 
 async fn collection_stats(
     State(state): State<AppState>,
+    headers: HeaderMap,
     Path(name): Path<String>,
 ) -> Response {
     let backend = state
         .backend::<VectorStoreAppBackend>()
         .expect("VectorStoreAppBackend");
+
+    let (_spend_auth, _preauth) = match billing_gate(&state, &headers, None, MIN_ADMIN_COST).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
 
     match backend.store.collection_stats(&name).await {
         Ok(stats) => Json(stats).into_response(),
