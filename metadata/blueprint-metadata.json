@@ -1,0 +1,217 @@
+{
+  "name": "Vector Store Blueprint",
+  "description": "Hosted vector storage and similarity search for RAG workloads on Tangle, with collection management, upserts, queries, and usage pricing.",
+  "author": "Tangle Network",
+  "category": "AI Infrastructure",
+  "image": null,
+  "website": "https://tangle.tools",
+  "codeRepository": "https://github.com/tangle-network/vector-store-blueprint",
+  "docs": "https://github.com/tangle-network/vector-store-blueprint#readme",
+  "integrity": null,
+  "blueprintUi": {
+    "displayName": "Vector Store",
+    "description": "Manage RAG collections, inspect vector usage, and run similarity-search jobs through the secure hosted blueprint UI.",
+    "requestedSlug": "vector-store",
+    "publisher": {
+      "name": "Tangle Network",
+      "namespace": "tangle",
+      "verified": false
+    },
+    "resources": {
+      "serviceLabel": "Vector service",
+      "itemLabel": "Collection",
+      "itemRoute": "custom"
+    },
+    "surfaces": [
+      "generic-overview",
+      "service-explorer",
+      "actions-panel",
+      "resources",
+      "metrics",
+      "permissions"
+    ],
+    "theme": {
+      "badgeLabel": "RAG storage",
+      "accentColor": "#047857",
+      "secondaryColor": "#064E3B",
+      "icon": "graph"
+    },
+    "overviewCards": [
+      {
+        "id": "rag-protocol-layer",
+        "kind": "callout",
+        "title": "RAG as protocol layer",
+        "description": "Vector collections, upserts, and similarity searches are protocol-controlled resources with explicit metering. Backend choice (Qdrant, ChromaDB) is operator-selected.",
+        "tone": "success"
+      },
+      {
+        "id": "supported-backends",
+        "kind": "checklist",
+        "title": "Vector backends",
+        "items": [
+          "Qdrant (production)",
+          "ChromaDB (planned)",
+          "InMemory (dev/testing)"
+        ],
+        "tone": "info"
+      },
+      {
+        "id": "distance-metrics",
+        "kind": "stat",
+        "title": "Distance metrics",
+        "description": "Per-collection similarity scoring for semantic search and retrieval.",
+        "value": "3",
+        "tone": "neutral"
+      }
+    ],
+    "actions": [
+      {
+        "id": "create-collection",
+        "label": "Create collection",
+        "description": "Provision a named vector collection with explicit dimensionality and distance metric. Collections scale to millions of vectors across Qdrant or in-memory backend.",
+        "target": "service",
+        "submitLabel": "Create",
+        "fields": [
+          {
+            "key": "collection_name",
+            "label": "Collection name",
+            "input": "text",
+            "required": true,
+            "placeholder": "docs"
+          },
+          {
+            "key": "dimensions",
+            "label": "Vector dimensions",
+            "input": "number",
+            "required": true,
+            "placeholder": "1536"
+          },
+          {
+            "key": "distance_metric",
+            "label": "Distance metric",
+            "input": "select",
+            "required": true,
+            "options": [
+              {
+                "label": "Cosine",
+                "value": "cosine"
+              },
+              {
+                "label": "Dot product",
+                "value": "dot"
+              },
+              {
+                "label": "Euclidean",
+                "value": "euclidean"
+              }
+            ]
+          }
+        ]
+      },
+      {
+        "id": "query-collection",
+        "label": "Query collection",
+        "description": "Execute a similarity search against a collection. Results include top-K scored points with metadata for retrieval-augmented generation pipelines.",
+        "target": "resource",
+        "submitLabel": "Query",
+        "fields": [
+          {
+            "key": "collection_name",
+            "label": "Collection",
+            "input": "text",
+            "required": true,
+            "placeholder": "docs"
+          },
+          {
+            "key": "top_k",
+            "label": "Top K results",
+            "input": "number",
+            "required": true,
+            "placeholder": "10"
+          },
+          {
+            "key": "filter_mode",
+            "label": "Metadata filter",
+            "input": "select",
+            "required": false,
+            "options": [
+              {
+                "label": "None",
+                "value": "none"
+              },
+              {
+                "label": "Must match",
+                "value": "must"
+              },
+              {
+                "label": "Should match",
+                "value": "should"
+              }
+            ]
+          }
+        ]
+      }
+    ],
+    "resourceViews": [
+      {
+        "id": "collections",
+        "title": "Collections",
+        "kind": "table",
+        "target": "resource",
+        "defaultSort": "updated_at:desc",
+        "columns": [
+          {
+            "key": "collection",
+            "label": "Collection",
+            "emphasis": true
+          },
+          {
+            "key": "dimensions",
+            "label": "Dimensions"
+          },
+          {
+            "key": "vectors",
+            "label": "Vectors"
+          },
+          {
+            "key": "backend",
+            "label": "Backend"
+          },
+          {
+            "key": "updated_at",
+            "label": "Updated"
+          }
+        ]
+      }
+    ],
+    "modules": [
+      {
+        "module": "metrics-overview",
+        "slot": "overview",
+        "metricKeys": [
+          "vectors_stored",
+          "queries_total",
+          "storage_gb"
+        ]
+      },
+      {
+        "module": "activity-feed",
+        "slot": "sidebar",
+        "eventKinds": [
+          "collection_created",
+          "vectors_upserted",
+          "query_executed"
+        ]
+      },
+      {
+        "module": "resource-events",
+        "slot": "resources",
+        "eventKinds": [
+          "collection_deleted",
+          "vectors_deleted",
+          "collection_stats"
+        ]
+      }
+    ]
+  }
+}
