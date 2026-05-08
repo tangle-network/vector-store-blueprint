@@ -4,3 +4,4 @@ cache/
 node_modules/
 .env
 *.log
+contracts/dependencies/tnt-core-*/
