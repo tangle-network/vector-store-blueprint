@@ -108,10 +108,24 @@ contract RegisterBlueprint is Script {
             profilingData: ""
         });
 
-        // No on-chain job entries: see config-comment above. The HTTP surface
-        // (`/v1/collections`, `/v1/collections/:name/upsert`, …) is documented
-        // in the manifest blueprint-metadata.json, not in the on-chain catalog.
-        def.jobs = new Types.JobDefinition[](0);
+        // Tangle's `BlueprintsCreate._validateBlueprintDefinition` rejects any
+        // blueprint with an empty `jobs` array (reverts `InvalidState()`), so
+        // declare a single sentinel job entry to satisfy the precondition.
+        //
+        // Vector-store has no real on-chain jobs — collection CRUD, upserts,
+        // and similarity queries are served over HTTP (x402) and metered
+        // off-chain. The full HTTP surface (`/v1/collections`,
+        // `/v1/collections/:name/upsert`, …) is documented in the manifest
+        // blueprint-metadata.json. This sentinel exists purely to clear the
+        // on-chain validator; nothing dispatches against it.
+        def.jobs = new Types.JobDefinition[](1);
+        def.jobs[0] = Types.JobDefinition({
+            name: "noop",
+            description: "Sentinel job; vector-store dispatches over HTTP, not on-chain.",
+            metadataUri: "https://github.com/tangle-network/vector-store-blueprint",
+            paramsSchema: "",
+            resultSchema: ""
+        });
 
         def.registrationSchema = "";
         def.requestSchema = "";
