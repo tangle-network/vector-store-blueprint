@@ -1,26 +1,13 @@
-# CLAUDE.md
+# Vector Store Blueprint
 
-## Project Overview
+Read [README.md](README.md) for setup and [operator/Cargo.toml](operator/Cargo.toml) for supported dependencies.
+Keep common payment validation, health, and metrics in `tangle-inference-core`.
 
-Vector Store Blueprint for Tangle Network. Operators serve hosted vector storage and similarity search for RAG pipelines. Supports multiple backends: Qdrant (production), ChromaDB (planned), InMemory (dev/testing).
+For backend behavior, inspect [store.rs](operator/src/store.rs).
+For pricing, limits, and subscription tiers, inspect [config.rs](operator/src/config.rs) and [VectorStoreBSM.sol](contracts/src/VectorStoreBSM.sol).
+[server.rs](operator/src/server.rs) owns HTTP authorization and cost calculations, including minimum charges and administrative operations.
+Do not infer complete storage settlement from configuration or a successful write alone.
 
-## Architecture
-
-Depends on [`tangle-inference-core`](../tangle-inference-core/) for shared billing, metrics, health, nonce store, x402 payment.
-
-- **contracts/src/VectorStoreBSM.sol** — operator registration, three-dimensional pricing (storage, writes, queries), capacity limits
-- **operator/src/store.rs** — `VectorStoreBackend` trait + `QdrantBackend` + `InMemoryBackend` implementations
-- **operator/src/server.rs** — REST API (7 endpoints), billing via `billing_gate` for upserts and queries
-- **operator/src/config.rs** — imports shared config from core, adds `VectorStoreConfig` (backend, pricing, limits)
-- **operator/src/lib.rs** — `VectorStoreServer` BackgroundService, on-chain job handler
-
-## Build
-
-```bash
-cd contracts && forge build
-cargo build -p vector-store
-```
-
-## Billing
-
-Per-request pricing via `FlatRequestCostModel`. Upserts billed proportional to batch size (count/1000 * price_per_k_upserts). Queries billed per request (price_per_k_queries / 1000). Storage billing (per-GB-month) deferred to subscription model.
+Verify API changes through the actual server, including access rejection, failed operations, and payment handling.
+Use the in-memory backend only for its documented development or test role.
+Exercise contract changes with actual deployments under `contracts/`.
