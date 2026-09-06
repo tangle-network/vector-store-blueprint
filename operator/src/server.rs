@@ -30,8 +30,7 @@ use tangle_inference_core::{AppState, FlatRequestCostModel, RequestGuard};
 
 use crate::config::OperatorConfig;
 use crate::store::{
-    CreateCollectionRequest, DeleteVectorsRequest, QueryRequest, UpsertRequest,
-    VectorStoreBackend,
+    CreateCollectionRequest, DeleteVectorsRequest, QueryRequest, UpsertRequest, VectorStoreBackend,
 };
 
 /// Minimum billing cost for admin operations (create/delete/list/stats).
@@ -79,7 +78,10 @@ pub fn build_router(state: AppState) -> Router {
         .route("/metrics", get(metrics_handler))
         .with_state(state)
         .layer(RequestBodyLimitLayer::new(max_body))
-        .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, std::time::Duration::from_secs(timeout)))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            std::time::Duration::from_secs(timeout),
+        ))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
 }
@@ -88,10 +90,7 @@ pub async fn start(
     state: AppState,
     mut shutdown_rx: watch::Receiver<bool>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-    let bind = format!(
-        "{}:{}",
-        state.server_config.host, state.server_config.port
-    );
+    let bind = format!("{}:{}", state.server_config.host, state.server_config.port);
     let app = build_router(state);
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!(bind = %bind, "Vector Store HTTP server listening");
@@ -112,6 +111,10 @@ pub async fn start(
 
 // ── Validation ────────────────────────────────────────────────────────
 
+#[expect(
+    clippy::result_large_err,
+    reason = "HTTP handlers return this validation response directly without an extra allocation."
+)]
 fn validate_collection_name(name: &str) -> Result<(), Response> {
     if name.is_empty()
         || name.contains("..")
@@ -198,10 +201,7 @@ async fn create_collection(
     }
 }
 
-async fn list_collections(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-) -> Response {
+async fn list_collections(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let backend = state
         .backend::<VectorStoreAppBackend>()
         .expect("VectorStoreAppBackend");
@@ -302,16 +302,14 @@ async fn upsert_vectors(
 
     // Bill proportional to batch size: (count / 1000) * price_per_k_upserts
     let batch_count = req.vectors.len() as u64;
-    let estimated_cost = batch_count
-        .saturating_mul(backend.config.vector_store.price_per_k_upserts)
-        / 1000;
+    let estimated_cost =
+        batch_count.saturating_mul(backend.config.vector_store.price_per_k_upserts) / 1000;
     let estimated_cost = estimated_cost.max(1); // minimum 1 unit
 
-    let (_spend_auth, _preauth) =
-        match billing_gate(&state, &headers, None, estimated_cost).await {
-            Ok(v) => v,
-            Err(resp) => return resp,
-        };
+    let (_spend_auth, _preauth) = match billing_gate(&state, &headers, None, estimated_cost).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
 
     let mut guard = RequestGuard::new("upsert");
 
@@ -357,11 +355,10 @@ async fn query_vectors(
     let estimated_cost = backend.config.vector_store.price_per_k_queries / 1000;
     let estimated_cost = estimated_cost.max(1);
 
-    let (_spend_auth, _preauth) =
-        match billing_gate(&state, &headers, None, estimated_cost).await {
-            Ok(v) => v,
-            Err(resp) => return resp,
-        };
+    let (_spend_auth, _preauth) = match billing_gate(&state, &headers, None, estimated_cost).await {
+        Ok(v) => v,
+        Err(resp) => return resp,
+    };
 
     let mut guard = RequestGuard::new("query");
 
