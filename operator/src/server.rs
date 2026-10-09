@@ -30,7 +30,8 @@ use tangle_inference_core::{AppState, FlatRequestCostModel, RequestGuard};
 
 use crate::config::OperatorConfig;
 use crate::store::{
-    CreateCollectionRequest, DeleteVectorsRequest, QueryRequest, UpsertRequest, VectorStoreBackend,
+    CreateCollectionRequest, DeleteVectorsRequest, QueryRequest, UnsupportedQueryFilter,
+    UpsertRequest, VectorStoreBackend,
 };
 
 /// Minimum billing cost for admin operations (create/delete/list/stats).
@@ -68,11 +69,11 @@ pub fn build_router(state: AppState) -> Router {
     Router::new()
         .route("/v1/collections", post(create_collection))
         .route("/v1/collections", get(list_collections))
-        .route("/v1/collections/{name}", delete(delete_collection))
-        .route("/v1/collections/{name}/upsert", post(upsert_vectors))
-        .route("/v1/collections/{name}/query", post(query_vectors))
-        .route("/v1/collections/{name}/vectors", delete(delete_vectors))
-        .route("/v1/collections/{name}/stats", get(collection_stats))
+        .route("/v1/collections/:name", delete(delete_collection))
+        .route("/v1/collections/:name/upsert", post(upsert_vectors))
+        .route("/v1/collections/:name/query", post(query_vectors))
+        .route("/v1/collections/:name/vectors", delete(delete_vectors))
+        .route("/v1/collections/:name/stats", get(collection_stats))
         .route("/v1/tiers", get(list_tiers))
         .route("/health", get(health))
         .route("/metrics", get(metrics_handler))
@@ -371,6 +372,12 @@ async fn query_vectors(
             guard.set_success();
             Json(serde_json::json!({ "results": results })).into_response()
         }
+        Err(e) if e.is::<UnsupportedQueryFilter>() => error_response(
+            StatusCode::BAD_REQUEST,
+            format!("{e}"),
+            "invalid_request_error",
+            "unsupported_filter",
+        ),
         Err(e) => error_response(
             StatusCode::BAD_REQUEST,
             format!("{e}"),
@@ -449,4 +456,134 @@ async fn health() -> Json<serde_json::Value> {
         "status": "ok",
         "service": "vector-store",
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::{HttpProxyBackend, ProxyProvider};
+
+    async fn test_server(billing_required: bool) -> (String, tokio::task::JoinHandle<()>) {
+        // Local-only synthetic identity. No chain or upstream request is needed by these tests.
+        let config: OperatorConfig = serde_json::from_value(serde_json::json!({
+            "tangle": {
+                "rpc_url": "http://127.0.0.1:1", "chain_id": 31337,
+                "operator_key": "11".repeat(32),
+                "shielded_credits": "0x0000000000000000000000000000000000000001",
+                "blueprint_id": 1, "service_id": 1
+            },
+            "server": {},
+            "billing": {
+                "payment_rails": {}, "billing_required": billing_required,
+                "max_spend_per_request": 1000000, "min_credit_balance": 0,
+                "nonce_store_path": null, "direct_replay_store_path": null
+            },
+            "vector_store": {}
+        }))
+        .unwrap();
+        let config = Arc::new(config);
+        let store = Arc::new(HttpProxyBackend::new(
+            "http://127.0.0.1:1".into(),
+            ProxyProvider::ChromaDB,
+            None,
+        ));
+        let backend = VectorStoreAppBackend::new(config.clone(), store);
+        let state =
+            AppState::from_config(&config.tangle, &config.server, &config.billing, 4, backend)
+                .unwrap();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, build_router(state)).await.unwrap();
+        });
+        (url, task)
+    }
+
+    #[tokio::test]
+    async fn named_collection_routes_reach_the_existing_authorization_gate() {
+        let (url, task) = test_server(true).await;
+        let client = reqwest::Client::new();
+        let cases = [
+            (
+                reqwest::Method::DELETE,
+                "/v1/collections/docs",
+                serde_json::json!({}),
+            ),
+            (
+                reqwest::Method::POST,
+                "/v1/collections/docs/upsert",
+                serde_json::json!({
+                    "vectors": [{"id": "one", "vector": [1.0]}]
+                }),
+            ),
+            (
+                reqwest::Method::POST,
+                "/v1/collections/docs/query",
+                serde_json::json!({
+                    "vector": [1.0], "filter": {"must": [{"key": "workspace", "value": "private"}]}
+                }),
+            ),
+            (
+                reqwest::Method::DELETE,
+                "/v1/collections/docs/vectors",
+                serde_json::json!({"ids": ["one"]}),
+            ),
+            (
+                reqwest::Method::GET,
+                "/v1/collections/docs/stats",
+                serde_json::json!({}),
+            ),
+        ];
+        for (method, path, body) in cases {
+            let response = client
+                .request(method, format!("{url}{path}"))
+                .json(&body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                reqwest::StatusCode::PAYMENT_REQUIRED,
+                "{path}"
+            );
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn unsupported_filter_fields_are_rejected_at_http_intake() {
+        let (url, task) = test_server(false).await;
+        for filter in [
+            serde_json::json!({"should": [{"key": "workspace", "value": "private"}]}),
+            serde_json::json!({"must": [{"key": "workspace", "value": "private", "operator": "not_equal"}]}),
+            serde_json::json!({"must": [{"key": "workspace", "value": "private"}], "should": []}),
+        ] {
+            let response = reqwest::Client::new()
+                .post(format!("{url}/v1/collections/docs/query"))
+                .json(&serde_json::json!({"vector": [1.0], "filter": filter}))
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(response.status(), reqwest::StatusCode::UNPROCESSABLE_ENTITY);
+        }
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn unsupported_proxy_filter_has_an_actionable_http_error() {
+        let (url, task) = test_server(false).await;
+        let response = reqwest::Client::new()
+            .post(format!("{url}/v1/collections/docs/query"))
+            .json(&serde_json::json!({
+                "vector": [1.0], "filter": {"must": [{"key": "workspace", "value": "private"}]}
+            }))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::BAD_REQUEST);
+        let body: serde_json::Value = response.json().await.unwrap();
+        assert_eq!(body["error"]["code"], "unsupported_filter");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        task.abort();
+    }
 }
