@@ -68,16 +68,23 @@ pub struct DeleteResult {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct QueryFilter {
     #[serde(default)]
     pub must: Vec<FilterCondition>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FilterCondition {
     pub key: String,
     pub value: serde_json::Value,
 }
+
+/// The selected proxy has no implementation of the metadata filter contract.
+#[derive(Debug, thiserror::Error)]
+#[error("metadata filters are not supported by this proxy backend")]
+pub struct UnsupportedQueryFilter;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateCollectionRequest {
@@ -920,8 +927,15 @@ impl VectorStoreBackend for HttpProxyBackend {
         collection: &str,
         vector: Vec<f32>,
         top_k: usize,
-        _filter: Option<QueryFilter>,
+        filter: Option<QueryFilter>,
     ) -> anyhow::Result<Vec<ScoredPoint>> {
+        // Never silently turn a constrained retrieval into an unfiltered search.
+        if filter
+            .as_ref()
+            .is_some_and(|filter| !filter.must.is_empty())
+        {
+            return Err(UnsupportedQueryFilter.into());
+        }
         let body = match &self.provider {
             ProxyProvider::ChromaDB => serde_json::json!({
                 "query_embeddings": [vector],
@@ -1193,6 +1207,154 @@ pub fn build_backend(backend: &VectorBackend) -> Box<dyn VectorStoreBackend> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn filter_deserialization_rejects_unrecognized_semantics() {
+        for filter in [
+            serde_json::json!({"should": [{"key": "workspace", "value": "private"}]}),
+            serde_json::json!({"must": [{"key": "workspace", "value": "private", "operator": "not_equal"}]}),
+            serde_json::json!({"must": [{"key": "workspace", "value": "private"}], "should": []}),
+            serde_json::json!({"must": [], "workspace": "private"}),
+        ] {
+            assert!(serde_json::from_value::<QueryFilter>(filter).is_err());
+        }
+        assert!(serde_json::from_value::<QueryFilter>(serde_json::json!({}))
+            .unwrap()
+            .must
+            .is_empty());
+        assert!(
+            serde_json::from_value::<QueryFilter>(serde_json::json!({"must": []}))
+                .unwrap()
+                .must
+                .is_empty()
+        );
+    }
+
+    fn proxy_providers() -> Vec<ProxyProvider> {
+        vec![
+            ProxyProvider::ChromaDB,
+            ProxyProvider::PgVector,
+            ProxyProvider::Milvus,
+            ProxyProvider::Weaviate,
+            ProxyProvider::Pinecone {
+                environment: "test".into(),
+            },
+        ]
+    }
+
+    async fn query_fixture() -> (
+        String,
+        Arc<std::sync::atomic::AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        use axum::{Json, Router};
+        let requests = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let observed = requests.clone();
+        let app = Router::new().fallback(move || {
+            let observed = observed.clone();
+            async move {
+                observed.fetch_add(1, Ordering::SeqCst);
+                Json(serde_json::json!({
+                    "ids": [[]], "distances": [[]], "metadatas": [[]],
+                    "data": [], "matches": [], "results": []
+                }))
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        (url, requests, task)
+    }
+
+    #[tokio::test]
+    async fn proxy_queries_reject_nonempty_filters_before_dispatch() {
+        let (url, requests, task) = query_fixture().await;
+        for provider in proxy_providers() {
+            let backend = HttpProxyBackend::new(url.clone(), provider, None);
+            let request: QueryRequest = serde_json::from_value(serde_json::json!({
+                "vector": [1.0, 0.0], "top_k": 5,
+                "filter": {"must": [{"key": "workspace", "value": "private"}]}
+            }))
+            .unwrap();
+            let error = backend
+                .query("docs", request.vector, request.top_k, request.filter)
+                .await
+                .expect_err("a filtered query must not run unfiltered");
+            assert!(error
+                .to_string()
+                .contains("metadata filters are not supported"));
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 0);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn proxy_queries_preserve_absent_and_empty_filters() {
+        let (url, requests, task) = query_fixture().await;
+        for provider in proxy_providers() {
+            let backend = HttpProxyBackend::new(url.clone(), provider, None);
+            for filter in [None, Some(QueryFilter { must: vec![] })] {
+                assert!(backend
+                    .query("docs", vec![1.0, 0.0], 5, filter)
+                    .await
+                    .unwrap()
+                    .is_empty());
+            }
+        }
+        assert_eq!(requests.load(Ordering::SeqCst), 10);
+        task.abort();
+    }
+
+    #[tokio::test]
+    async fn qdrant_query_transmits_every_filter_condition() {
+        use axum::{Json, Router};
+        let (send, mut receive) = tokio::sync::mpsc::channel(1);
+        let app = Router::new().fallback(move |Json(body): Json<serde_json::Value>| {
+            let send = send.clone();
+            async move {
+                send.send(body).await.unwrap();
+                Json(serde_json::json!({"result": []}))
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let task = tokio::spawn(async move {
+            axum::serve(listener, app).await.unwrap();
+        });
+        let backend = QdrantBackend::new(url);
+        backend
+            .query(
+                "docs",
+                vec![1.0],
+                5,
+                Some(QueryFilter {
+                    must: vec![
+                        FilterCondition {
+                            key: "workspace".into(),
+                            value: serde_json::json!("private"),
+                        },
+                        FilterCondition {
+                            key: "active".into(),
+                            value: serde_json::json!(true),
+                        },
+                    ],
+                }),
+            )
+            .await
+            .unwrap();
+        let body = receive.recv().await.unwrap();
+        assert_eq!(
+            body["filter"],
+            serde_json::json!({"must": [
+                {"key": "workspace", "match": {"value": "private"}},
+                {"key": "active", "match": {"value": true}},
+            ]})
+        );
+        task.abort();
+    }
 
     #[tokio::test]
     async fn inmemory_crud() {

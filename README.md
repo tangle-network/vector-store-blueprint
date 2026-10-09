@@ -19,8 +19,25 @@ Tangle Blueprint for hosted vector storage and similarity search — the missing
 | Backend | Use Case | Config |
 |---------|----------|--------|
 | Qdrant | Production RAG | `backend = "qdrant"`, `url = "http://localhost:6333"` |
-| ChromaDB | Planned | `backend = "chromadb"` |
+| ChromaDB / PgVector / Milvus / Weaviate / Pinecone | Proxy adapters present; filtering unsupported | See `VectorBackend` configuration |
 | InMemory | Dev/testing | `backend = "inmemory"` (default) |
+
+## Query filters
+
+The query API accepts equality conditions combined with AND:
+
+```json
+{"vector": [1.0, 0.0], "top_k": 5, "filter": {"must": [{"key": "source", "value": "readme"}]}}
+```
+
+- Qdrant transmits these conditions to its search API; InMemory evaluates them locally.
+- The ChromaDB, PgVector, Milvus, Weaviate, and Pinecone proxy adapters do not implement this filter contract. A nonempty `must` is rejected before an upstream request, with HTTP 400 and `error.code = "unsupported_filter"` (`error.type = "invalid_request_error"`).
+- An omitted/null filter, `{}`, or `{"must": []}` keeps the existing unfiltered query behavior.
+- Unknown filter fields (including `should`) and unknown condition fields/operators are rejected with HTTP 422. Each condition supports only `key` and `value`.
+
+This is a compatibility change: requests whose filter constraints were previously silently ignored now fail explicitly. Clients must handle the error or select a backend that supports their filter; they must not automatically retry without the filter.
+
+Metadata filters are retrieval constraints, not tenant authorization. The existing billing/authentication gate is unchanged; collection ownership and tenant isolation still require a separate authorization design.
 
 ## Pricing
 
